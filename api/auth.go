@@ -29,6 +29,11 @@ func AuthHttpCtx(reAuth, nonInteractive bool) *transport.HttpClientCtx {
 		if nonInteractive {
 			log.Error.Fatal("missing token, not asking, aborting")
 		}
+		// Double-check: if stdin is not available (Docker/container environment), fail fast
+		// This prevents infinite loops when readCode() tries to read from empty stdin
+		if os.Getenv("RMAPI_SERVER_MODE") != "" || os.Getenv("HOME") == "/home/app" {
+			log.Error.Fatal("Cannot read code interactively in server/container mode. Use /api/auth endpoint instead.")
+		}
 		deviceToken, err := newDeviceToken(&httpClientCtx, readCode())
 
 		if err != nil {
@@ -65,16 +70,43 @@ func AuthHttpCtx(reAuth, nonInteractive bool) *transport.HttpClientCtx {
 }
 
 func readCode() string {
+	return readCodeWithRetry(0)
+}
+
+func readCodeWithRetry(retryCount int) string {
+	const maxRetries = 3
+	
+	if retryCount >= maxRetries {
+		log.Error.Fatal("Failed to read valid code after multiple attempts. Aborting.")
+		return ""
+	}
+
 	reader := bufio.NewReader(os.Stdin)
 	fmt.Print("Enter one-time code (go to https://my.remarkable.com/device/browser/connect): ")
-	code, _ := reader.ReadString('\n')
+	code, err := reader.ReadString('\n')
+	
+	// If we can't read from stdin or get EOF, fail immediately
+	if err != nil || code == "" {
+		log.Error.Fatal("Cannot read code interactively: stdin is not available or empty. Use server mode API endpoint /api/auth instead.")
+		return ""
+	}
 
 	code = strings.TrimSuffix(code, "\n")
 	code = strings.TrimSuffix(code, "\r")
 
+	// If code is empty after trimming, it means stdin had just newlines (common in Docker)
+	if code == "" {
+		if retryCount == 0 {
+			log.Error.Println("Received empty input from stdin. This usually means stdin is not connected to a terminal.")
+			log.Error.Println("If running in Docker/server mode, use the /api/auth endpoint instead of interactive authentication.")
+		}
+		log.Error.Fatal("Cannot read code interactively: stdin is not a terminal. Use server mode API endpoint /api/auth instead.")
+		return ""
+	}
+
 	if len(code) != 8 {
-		log.Error.Println("Code has the wrong length, it should be 8")
-		return readCode()
+		log.Error.Printf("Code has the wrong length, it should be 8 (got %d characters: %q). Attempt %d/%d", len(code), code, retryCount+1, maxRetries)
+		return readCodeWithRetry(retryCount + 1)
 	}
 
 	return code

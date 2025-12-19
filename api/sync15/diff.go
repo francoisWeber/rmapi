@@ -373,7 +373,7 @@ func DiffTrees(current, previous *HashTree) (*TreeDiffResult, error) {
 
 // LoadPreviousTree loads the previous tree from tree.cache.previous
 func LoadPreviousTree() (*HashTree, error) {
-	cacheFile, err := getCachedTreePath()
+	cacheFile, err := GetCachedTreePath()
 	if err != nil {
 		return nil, err
 	}
