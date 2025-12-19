@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/juruen/rmapi/api"
+	"github.com/juruen/rmapi/api/sync15"
 	"github.com/juruen/rmapi/archive"
 	"github.com/juruen/rmapi/config"
 	"github.com/juruen/rmapi/filetree"
@@ -124,60 +126,33 @@ func (s *ApiServer) initialize() error {
 	return nil
 }
 
-// refreshTokens refreshes the user token and recreates the API context
+// refreshTokens refreshes only the user token without recreating the API context
 func (s *ApiServer) refreshTokens() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	
+	if s.ctx == nil {
+		return fmt.Errorf("API context not initialized")
+	}
+	
+	err := s.ctx.RefreshToken()
+	if err != nil {
+		return err
+	}
+	
+	// Update user info from refreshed token
 	configPath, err := config.ConfigPath()
 	if err != nil {
 		return fmt.Errorf("failed to get config path: %v", err)
 	}
-	
 	authTokens := config.LoadTokens(configPath)
-	if authTokens.DeviceToken == "" {
-		return fmt.Errorf("no device token found")
-	}
-	
-	// Create HTTP context with existing device token
-	httpClientCtx := transport.CreateHttpClientCtx(authTokens)
-	
-	// Refresh user token
-	userToken, err := api.NewUserToken(&httpClientCtx)
-	if err != nil {
-		return fmt.Errorf("failed to refresh user token: %v", err)
-	}
-	
-	// Save refreshed token
-	authTokens.UserToken = userToken
-	config.SaveTokens(configPath, authTokens)
-	httpClientCtx.Tokens.UserToken = userToken
-	
-	// Parse token to get user info
-	userInfo, err := api.ParseToken(userToken)
+	userInfo, err := api.ParseToken(authTokens.UserToken)
 	if err != nil {
 		return fmt.Errorf("failed to parse refreshed token: %v", err)
 	}
 	
-	// Recreate API context with refreshed token
-	ctx, err := api.CreateApiCtx(&httpClientCtx, userInfo.SyncVersion)
-	if err != nil {
-		return fmt.Errorf("failed to recreate API context: %v", err)
-	}
-	
-	// Update shell context
-	shellCtx := &shell.ShellCtxt{
-		Node:           ctx.Filetree().Root(),
-		Api:            ctx,
-		Path:           ctx.Filetree().Root().Name(),
-		UseHiddenFiles: shell.UseHiddenFiles(),
-		UserInfo:       *userInfo,
-		JSONOutput:     true,
-	}
-	
-	s.ctx = ctx
 	s.userInfo = userInfo
-	s.shellCtx = shellCtx
+	s.shellCtx.UserInfo = *userInfo
 	
 	log.Info.Println("Tokens refreshed successfully")
 	return nil
@@ -571,14 +546,51 @@ func (s *ApiServer) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	outputPath := fmt.Sprintf("%s.%s", node.Name(), util.RMDOC)
-	err = s.fetchDocumentWithRetry(node.Document.ID, outputPath)
+	// Download the file to a temporary location
+	tmpFile, err := os.CreateTemp("", fmt.Sprintf("rmapi-*.%s", util.RMDOC))
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, fmt.Errorf("failed to create temp file: %v", err))
+		return
+	}
+	tmpFile.Close()
+	rmdocPath := tmpFile.Name()
+	defer os.Remove(rmdocPath)
+
+	err = s.fetchDocumentWithRetry(node.Document.ID, rmdocPath)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, fmt.Errorf("failed to download file: %v", err))
 		return
 	}
 
-	s.writeSuccess(w, map[string]string{"message": "Download OK", "file": outputPath})
+	// Open the downloaded file
+	file, err := os.Open(rmdocPath)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, fmt.Errorf("failed to open file: %v", err))
+		return
+	}
+	defer file.Close()
+
+	// Get file info for Content-Length header
+	fileInfo, err := file.Stat()
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, fmt.Errorf("failed to stat file: %v", err))
+		return
+	}
+
+	// Set headers for file download
+	filename := fmt.Sprintf("%s.%s", node.Name(), util.RMDOC)
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", fileInfo.Size()))
+	w.WriteHeader(http.StatusOK)
+
+	// Stream the file content to the response
+	_, err = io.Copy(w, file)
+	if err != nil {
+		log.Error.Printf("Failed to stream file: %v", err)
+		// Can't write error response here as headers are already sent
+		return
+	}
 }
 
 // Helper function to generate PNG to memory buffer
@@ -924,46 +936,125 @@ func (s *ApiServer) handleMkdir(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req struct {
-		Path string `json:"path"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.writeError(w, http.StatusBadRequest, err)
-		return
+	var target string
+	recursive := false
+
+	// Try to get path from query parameter first
+	target = r.URL.Query().Get("path")
+	recursiveParam := r.URL.Query().Get("recursive")
+	if recursiveParam == "true" || recursiveParam == "1" {
+		recursive = true
 	}
 
-	if req.Path == "" {
+	if target == "" {
+		// Fall back to JSON body
+		var req struct {
+			Path      string `json:"path"`
+			Recursive bool   `json:"recursive"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			s.writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		target = req.Path
+		recursive = req.Recursive
+	}
+
+	if target == "" {
 		s.writeError(w, http.StatusBadRequest, fmt.Errorf("path is required"))
 		return
 	}
 
-	target := req.Path
-	_, err := s.ctx.Filetree().NodeByPath(target, s.shellCtx.Node)
+	// Check if target already exists
+	existingNode, err := s.ctx.Filetree().NodeByPath(target, s.shellCtx.Node)
 	if err == nil {
-		s.writeError(w, http.StatusConflict, fmt.Errorf("entry already exists"))
+		if existingNode.IsDirectory() {
+			s.writeSuccess(w, map[string]interface{}{
+				"message": "Directory already exists",
+				"node":    shell.NodeToJSON(existingNode),
+			})
+			return
+		} else {
+			s.writeError(w, http.StatusConflict, fmt.Errorf("file already exists at path"))
+			return
+		}
+	}
+
+	// Normalize path
+	target = strings.Trim(target, "/")
+	if target == "" {
+		s.writeError(w, http.StatusBadRequest, fmt.Errorf("invalid path"))
 		return
 	}
 
-	parentDir := path.Dir(target)
-	newDir := path.Base(target)
-
-	if newDir == "/" || newDir == "." {
+	// Split path into components
+	parts := strings.Split(target, "/")
+	if len(parts) == 0 {
 		s.writeError(w, http.StatusBadRequest, fmt.Errorf("invalid directory name"))
 		return
 	}
 
-	parentNode, err := s.ctx.Filetree().NodeByPath(parentDir, s.shellCtx.Node)
-	if err != nil || parentNode.IsFile() {
-		s.writeError(w, http.StatusNotFound, fmt.Errorf("directory doesn't exist"))
+	// Find or create parent directories recursively
+	currentPath := ""
+	currentNode := s.shellCtx.Node
+	parentId := ""
+
+	for i := 0; i < len(parts)-1; i++ {
+		part := parts[i]
+		if part == "" {
+			continue
+		}
+		currentPath = path.Join(currentPath, part)
+
+		// Check if this directory exists
+		checkNode, err := s.ctx.Filetree().NodeByPath(currentPath, s.shellCtx.Node)
+		if err != nil {
+			// Directory doesn't exist
+			if !recursive {
+				s.writeError(w, http.StatusNotFound, fmt.Errorf("parent directory doesn't exist: %s (use recursive=true to create)", currentPath))
+				return
+			}
+
+			// Create the parent directory
+			createParentId := parentId
+			if currentNode.IsRoot() {
+				createParentId = ""
+			}
+			parentDoc, err := s.ctx.CreateDir(createParentId, part, true)
+			if err != nil {
+				s.writeError(w, http.StatusInternalServerError, fmt.Errorf("failed to create parent directory %s: %v", currentPath, err))
+				return
+			}
+			s.ctx.Filetree().AddDocument(parentDoc)
+			newNode := model.CreateNode(*parentDoc)
+			checkNode = &newNode
+		}
+
+		if checkNode.IsFile() {
+			s.writeError(w, http.StatusBadRequest, fmt.Errorf("path component is a file, not a directory: %s", currentPath))
+			return
+		}
+
+		currentNode = checkNode
+		parentId = currentNode.Id()
+		if currentNode.IsRoot() {
+			parentId = ""
+		}
+	}
+
+	// Create the final directory
+	newDir := parts[len(parts)-1]
+	if newDir == "" || newDir == "." || newDir == ".." {
+		s.writeError(w, http.StatusBadRequest, fmt.Errorf("invalid directory name"))
 		return
 	}
 
-	parentId := parentNode.Id()
-	if parentNode.IsRoot() {
-		parentId = ""
+	finalParentId := parentId
+	if currentNode.IsRoot() {
+		finalParentId = ""
 	}
 
-	document, err := s.ctx.CreateDir(parentId, newDir, true)
+	document, err := s.ctx.CreateDir(finalParentId, newDir, true)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, fmt.Errorf("failed to create directory: %v", err))
 		return
@@ -1152,29 +1243,92 @@ func (s *ApiServer) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := r.ParseMultipartForm(32 << 20) // 32 MB max
-	if err != nil {
-		s.writeError(w, http.StatusBadRequest, fmt.Errorf("failed to parse multipart form: %v", err))
-		return
-	}
+	contentType := r.Header.Get("Content-Type")
+	var file io.ReadCloser
+	var filename string
+	var destDir, force, contentOnly, coverpageStr string
 
-	file, header, err := r.FormFile("file")
-	if err != nil {
-		s.writeError(w, http.StatusBadRequest, fmt.Errorf("file is required: %v", err))
-		return
+	// Check if it's multipart/form-data or raw binary
+	if strings.HasPrefix(contentType, "multipart/form-data") {
+		// Handle multipart/form-data upload
+		err := r.ParseMultipartForm(32 << 20) // 32 MB max
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, fmt.Errorf("failed to parse multipart form: %v", err))
+			return
+		}
+
+		var header *multipart.FileHeader
+		file, header, err = r.FormFile("file")
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, fmt.Errorf("file is required: %v", err))
+			return
+		}
+		filename = header.Filename
+
+		destDir = r.FormValue("destination")
+		force = r.FormValue("force")
+		contentOnly = r.FormValue("contentOnly")
+		coverpageStr = r.FormValue("coverpage")
+	} else {
+		// Handle raw binary upload
+		// Get filename from X-Filename header or Content-Disposition header
+		filename = r.Header.Get("X-Filename")
+		if filename == "" {
+			contentDisposition := r.Header.Get("Content-Disposition")
+			if contentDisposition != "" {
+				// Parse filename from Content-Disposition: attachment; filename="example.pdf"
+				// Also handles: filename=example.pdf (without quotes)
+				if idx := strings.Index(contentDisposition, "filename="); idx != -1 {
+					filenamePart := contentDisposition[idx+9:]
+					// Remove quotes if present
+					filename = strings.Trim(filenamePart, `"`)
+					// Handle cases like: filename="example.pdf"; or filename=example.pdf;
+					if idx2 := strings.Index(filename, ";"); idx2 != -1 {
+						filename = filename[:idx2]
+					}
+					filename = strings.TrimSpace(filename)
+				}
+			}
+		}
+		if filename == "" {
+			// Default filename based on Content-Type
+			if strings.Contains(contentType, "pdf") {
+				filename = "document.pdf"
+			} else {
+				filename = "document"
+			}
+		}
+
+		file = r.Body
+
+		// Get parameters from query string or headers
+		destDir = r.URL.Query().Get("destination")
+		if destDir == "" {
+			destDir = r.Header.Get("X-Destination")
+		}
+		force = r.URL.Query().Get("force")
+		if force == "" {
+			force = r.Header.Get("X-Force")
+		}
+		contentOnly = r.URL.Query().Get("contentOnly")
+		if contentOnly == "" {
+			contentOnly = r.Header.Get("X-Content-Only")
+		}
+		coverpageStr = r.URL.Query().Get("coverpage")
+		if coverpageStr == "" {
+			coverpageStr = r.Header.Get("X-Coverpage")
+		}
 	}
 	defer file.Close()
 
-	destDir := r.FormValue("destination")
 	if destDir == "" {
 		destDir = s.shellCtx.Path
 	}
 
-	force := r.FormValue("force") == "true"
-	contentOnly := r.FormValue("contentOnly") == "true"
-	coverpageStr := r.FormValue("coverpage")
+	forceBool := force == "true"
+	contentOnlyBool := contentOnly == "true"
 
-	if force && contentOnly {
+	if forceBool && contentOnlyBool {
 		s.writeError(w, http.StatusBadRequest, fmt.Errorf("--force and --content-only cannot be used together"))
 		return
 	}
@@ -1185,13 +1339,28 @@ func (s *ApiServer) handlePut(w http.ResponseWriter, r *http.Request) {
 		coverpageFlag = &val
 	}
 
-	// Save uploaded file temporarily
-	tmpFile, err := os.CreateTemp("", fmt.Sprintf("rmapi-upload-*%s", filepath.Ext(header.Filename)))
+	// Save uploaded file temporarily with the desired filename
+	// First create a temp directory to avoid filename conflicts
+	tmpDir, err := os.MkdirTemp("", "rmapi-upload-")
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, fmt.Errorf("failed to create temp directory: %v", err))
+		return
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Sanitize filename to prevent path traversal
+	safeFilename := filepath.Base(filename) // Remove any directory components
+	if safeFilename == "" || safeFilename == "." || safeFilename == ".." {
+		safeFilename = "document.pdf"
+	}
+
+	// Create temp file with the desired filename
+	tmpFilePath := filepath.Join(tmpDir, safeFilename)
+	tmpFile, err := os.Create(tmpFilePath)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, fmt.Errorf("failed to create temp file: %v", err))
 		return
 	}
-	defer os.Remove(tmpFile.Name())
 
 	_, err = io.Copy(tmpFile, file)
 	tmpFile.Close()
@@ -1206,10 +1375,10 @@ func (s *ApiServer) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	docName, _ := util.DocPathToName(header.Filename)
+	docName, _ := util.DocPathToName(filename)
 
-	if contentOnly {
-		_, ext := util.DocPathToName(header.Filename)
+	if contentOnlyBool {
+		_, ext := util.DocPathToName(filename)
 		if ext != "pdf" {
 			s.writeError(w, http.StatusBadRequest, fmt.Errorf("--content-only can only be used with PDF files"))
 			return
@@ -1219,7 +1388,7 @@ func (s *ApiServer) handlePut(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			// Document doesn't exist, create new one
 			dstDir := node.Id()
-			document, err := s.ctx.UploadDocument(dstDir, tmpFile.Name(), true, coverpageFlag)
+			document, err := s.ctx.UploadDocument(dstDir, tmpFilePath, true, coverpageFlag)
 			if err != nil {
 				s.writeError(w, http.StatusInternalServerError, fmt.Errorf("failed to upload file: %v", err))
 				return
@@ -1238,7 +1407,7 @@ func (s *ApiServer) handlePut(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if err := s.ctx.ReplaceDocumentFile(existingNode.Document.ID, tmpFile.Name(), true); err != nil {
+		if err := s.ctx.ReplaceDocumentFile(existingNode.Document.ID, tmpFilePath, true); err != nil {
 			s.writeError(w, http.StatusInternalServerError, fmt.Errorf("failed to replace content: %v", err))
 			return
 		}
@@ -1253,7 +1422,7 @@ func (s *ApiServer) handlePut(w http.ResponseWriter, r *http.Request) {
 	existingNode, err := s.ctx.Filetree().NodeByPath(docName, node)
 	if err == nil {
 		// File exists
-		if !force {
+		if !forceBool {
 			s.writeError(w, http.StatusConflict, fmt.Errorf("entry already exists (use force=true to recreate, contentOnly=true to replace content)"))
 			return
 		}
@@ -1272,7 +1441,7 @@ func (s *ApiServer) handlePut(w http.ResponseWriter, r *http.Request) {
 
 		// Upload new document
 		dstDir := node.Id()
-		document, err := s.ctx.UploadDocument(dstDir, tmpFile.Name(), true, coverpageFlag)
+		document, err := s.ctx.UploadDocument(dstDir, tmpFilePath, true, coverpageFlag)
 		if err != nil {
 			s.writeError(w, http.StatusInternalServerError, fmt.Errorf("failed to upload replacement file: %v", err))
 			return
@@ -1289,7 +1458,7 @@ func (s *ApiServer) handlePut(w http.ResponseWriter, r *http.Request) {
 
 	// File doesn't exist, upload new document
 	dstDir := node.Id()
-	document, err := s.ctx.UploadDocument(dstDir, tmpFile.Name(), true, coverpageFlag)
+	document, err := s.ctx.UploadDocument(dstDir, tmpFilePath, true, coverpageFlag)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, fmt.Errorf("failed to upload file: %v", err))
 		return
@@ -1451,6 +1620,10 @@ func (s *ApiServer) handleRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !s.requireAuth(w, r) {
+		return
+	}
+
 	has, gen, err := s.ctx.Refresh()
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, err)
@@ -1469,7 +1642,108 @@ func (s *ApiServer) handleRefresh(w http.ResponseWriter, r *http.Request) {
 		"rootHash":    has,
 		"generation":  gen,
 		"currentPath": s.shellCtx.Path,
+		"message":     "Tree refreshed",
 	})
+}
+
+// POST /api/refresh-token
+func (s *ApiServer) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if !s.requireAuth(w, r) {
+		return
+	}
+
+	err := s.ctx.RefreshToken()
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	s.mu.RLock()
+	user := s.userInfo.User
+	s.mu.RUnlock()
+
+	s.writeSuccess(w, map[string]interface{}{
+		"message": "Token refreshed successfully",
+		"user":    user,
+	})
+}
+
+// POST /api/refresh-tree
+func (s *ApiServer) handleRefreshTree(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if !s.requireAuth(w, r) {
+		return
+	}
+
+	has, gen, err := s.ctx.RefreshTree()
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	n, err := s.ctx.Filetree().NodeByPath(s.shellCtx.Path, nil)
+	if err != nil {
+		s.shellCtx.Node = s.ctx.Filetree().Root()
+		s.shellCtx.Path = s.shellCtx.Node.Name()
+	} else {
+		s.shellCtx.Node = n
+	}
+
+	s.writeSuccess(w, map[string]interface{}{
+		"rootHash":    has,
+		"generation":  gen,
+		"currentPath": s.shellCtx.Path,
+		"message":     "Tree refreshed",
+	})
+}
+
+// GET /api/difference
+func (s *ApiServer) handleDifference(w http.ResponseWriter, r *http.Request) {
+	// Force log to stderr to ensure we see it
+	fmt.Fprintf(os.Stderr, "handleDifference called\n")
+	log.Info.Println("handleDifference called")
+	
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if !s.requireAuth(w, r) {
+		fmt.Fprintf(os.Stderr, "handleDifference: auth failed\n")
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "handleDifference: calling DiffTreeCache\n")
+	diff, err := s.ctx.DiffTreeCache()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "handleDifference: DiffTreeCache error: %v\n", err)
+		log.Error.Printf("DiffTreeCache error: %v", err)
+		s.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	// Return simplified JSON format by default
+	simplified := sync15.FormatDiffJSON(diff)
+	fmt.Fprintf(os.Stderr, "handleDifference: result - %d new, %d removed, %d moved, %d modified\n", 
+		len(simplified.New), len(simplified.Removed), len(simplified.Moved), len(simplified.Modified))
+	log.Info.Printf("Diff result: %d new, %d removed, %d moved, %d modified", 
+		len(simplified.New), len(simplified.Removed), len(simplified.Moved), len(simplified.Modified))
+	
+	// Debug: log the actual simplified structure
+	jsonBytes, _ := json.Marshal(simplified)
+	fmt.Fprintf(os.Stderr, "handleDifference: Simplified JSON: %s\n", string(jsonBytes))
+	log.Info.Printf("Simplified JSON: %s", string(jsonBytes))
+	
+	s.writeSuccess(w, simplified)
 }
 
 // GET /api/version
@@ -1510,6 +1784,9 @@ func runServerMode(port string) {
 	mux.HandleFunc("/api/find", server.handleFind)
 	mux.HandleFunc("/api/account", server.handleAccount)
 	mux.HandleFunc("/api/refresh", server.handleRefresh)
+	mux.HandleFunc("/api/refresh-token", server.handleRefreshToken)
+	mux.HandleFunc("/api/refresh-tree", server.handleRefreshTree)
+	mux.HandleFunc("/api/difference", server.handleDifference)
 	mux.HandleFunc("/api/version", server.handleVersion)
 
 	// Health check endpoint
@@ -1544,7 +1821,7 @@ func runServerMode(port string) {
 		<li>GET /api/ls - List directory</li>
 		<li>GET /api/pwd - Get current directory</li>
 		<li>POST /api/cd - Change directory</li>
-		<li>GET /api/get - Download file</li>
+		<li>GET /api/get - Download file (streams binary .rmdoc file)</li>
 		<li>GET /api/convert - Convert file to PNG</li>
 		<li>GET /api/hwr - Perform handwriting recognition (requires RMAPI_HWR_APPLICATIONKEY and RMAPI_HWR_HMAC env vars). Use inline=true to stream ZIP file with TXT files</li>
 		<li>POST /api/mkdir - Create directory</li>
@@ -1555,6 +1832,9 @@ func runServerMode(port string) {
 		<li>GET /api/find - Find files</li>
 		<li>GET /api/account - Get account info</li>
 		<li>POST /api/refresh - Refresh file tree</li>
+		<li>POST /api/refresh-token - Refresh authentication token only</li>
+		<li>POST /api/refresh-tree - Refresh file tree</li>
+		<li>GET /api/difference - Compare tree.cache with tree.cache.previous and show changes (JSON format)</li>
 		<li>GET /api/version - Get version</li>
 	</ul>
 	<p><strong>Note:</strong> On first startup, authenticate using POST /api/auth with your one-time code from <a href="https://my.remarkable.com/device/browser/connect">https://my.remarkable.com/device/browser/connect</a></p>

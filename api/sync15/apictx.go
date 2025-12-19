@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/juruen/rmapi/archive"
+	"github.com/juruen/rmapi/config"
 	"github.com/juruen/rmapi/filetree"
 	"github.com/juruen/rmapi/log"
 	"github.com/juruen/rmapi/model"
@@ -58,13 +59,73 @@ func (ctx *ApiCtx) Filetree() *filetree.FileTreeCtx {
 	return ctx.ft
 }
 
+func (ctx *ApiCtx) HashTree() *HashTree {
+	return ctx.hashTree
+}
+
 func (ctx *ApiCtx) Refresh() (string, int64, error) {
 	err := ctx.hashTree.Mirror(ctx.blobStorage, concurrent)
 	if err != nil {
 		return "", 0, err
 	}
 	ctx.ft = DocumentsFileTree(ctx.hashTree)
+	err = saveTree(ctx.hashTree)
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to save tree cache: %v", err)
+	}
 	return ctx.hashTree.Hash, ctx.hashTree.Generation, nil
+}
+
+// RefreshTree syncs the file tree with remote
+func (ctx *ApiCtx) RefreshTree() (string, int64, error) {
+	// Backup the current tree state before refreshing
+	if err := backupTreeCache(); err != nil {
+		log.Warning.Printf("Failed to backup tree cache: %v", err)
+		// Continue with refresh even if backup fails
+	}
+	
+	err := ctx.hashTree.Mirror(ctx.blobStorage, concurrent)
+	if err != nil {
+		return "", 0, err
+	}
+	ctx.ft = DocumentsFileTree(ctx.hashTree)
+	err = saveTree(ctx.hashTree)
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to save tree cache: %v", err)
+	}
+	return ctx.hashTree.Hash, ctx.hashTree.Generation, nil
+}
+
+// DiffTreeCache compares the current tree.cache with tree.cache.previous
+func (ctx *ApiCtx) DiffTreeCache() (*TreeDiffResult, error) {
+	return DiffTreeCache()
+}
+
+// RefreshToken updates the user token in the existing context without recreating it
+func (ctx *ApiCtx) RefreshToken() error {
+	// Get new user token using existing device token
+	// Use transport directly to avoid import cycle
+	resp := transport.BodyString{}
+	err := ctx.Http.Post(transport.DeviceBearer, config.NewUserDevice, nil, &resp)
+	if err != nil {
+		return fmt.Errorf("failed to refresh user token: %v", err)
+	}
+	
+	userToken := resp.Content
+	
+	// Update token in the context
+	ctx.Http.Tokens.UserToken = userToken
+	
+	// Save to config
+	configPath, err := config.ConfigPath()
+	if err != nil {
+		return fmt.Errorf("failed to get config path: %v", err)
+	}
+	authTokens := config.LoadTokens(configPath)
+	authTokens.UserToken = userToken
+	config.SaveTokens(configPath, authTokens)
+	
+	return nil
 }
 
 // Nuke removes all documents from the account
