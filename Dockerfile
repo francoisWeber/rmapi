@@ -37,4 +37,4 @@ COPY --from=builder /src/rmapi /usr/local/bin/rmapi
 EXPOSE 8080
 
 ENTRYPOINT ["docker-entrypoint.sh"]
-CMD ["rmapi"] 
+CMD ["rmapi", "--server", "--port", "8080"] 

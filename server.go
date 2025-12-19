@@ -1757,6 +1757,21 @@ func (s *ApiServer) handleVersion(w http.ResponseWriter, r *http.Request) {
 }
 
 func runServerMode(port string) {
+	// Log configuration and tree cache file locations (always visible)
+	configPath, err := config.ConfigPath()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "WARNING: Failed to get config path: %v\n", err)
+	} else {
+		fmt.Fprintf(os.Stderr, "Configuration file: %s\n", configPath)
+	}
+
+	treeCachePath, err := sync15.GetCachedTreePath()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "WARNING: Failed to get tree cache path: %v\n", err)
+	} else {
+		fmt.Fprintf(os.Stderr, "Tree cache file: %s\n", treeCachePath)
+	}
+
 	// Run HTTP server mode
 	server, err := NewApiServer()
 	if err != nil {

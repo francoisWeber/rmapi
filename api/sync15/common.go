@@ -28,7 +28,8 @@ func HashEntries(entries []*Entry) (string, error) {
 	return hashStr, nil
 }
 
-func getCachedTreePath() (string, error) {
+// GetCachedTreePath returns the path to the tree cache file
+func GetCachedTreePath() (string, error) {
 	cachedir, err := os.UserCacheDir()
 	if err != nil {
 		// Fallback to home directory if cache dir cannot be determined
@@ -65,7 +66,7 @@ func getCachedTreePath() (string, error) {
 const cacheVersion = 3
 
 func loadTree() (*HashTree, error) {
-	cacheFile, err := getCachedTreePath()
+	cacheFile, err := GetCachedTreePath()
 	if err != nil {
 		return nil, err
 	}
@@ -92,7 +93,7 @@ func loadTree() (*HashTree, error) {
 
 // backupTreeCache creates a backup of the current tree.cache file as tree.cache.previous
 func backupTreeCache() error {
-	cacheFile, err := getCachedTreePath()
+	cacheFile, err := GetCachedTreePath()
 	if err != nil {
 		return err
 	}
@@ -123,7 +124,7 @@ func backupTreeCache() error {
 
 // save cached version of the tree
 func saveTree(tree *HashTree) error {
-	cacheFile, err := getCachedTreePath()
+	cacheFile, err := GetCachedTreePath()
 	log.Info.Println("Writing cache: ", cacheFile)
 	if err != nil {
 		return err
